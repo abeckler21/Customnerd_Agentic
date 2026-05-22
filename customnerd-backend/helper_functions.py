@@ -72,35 +72,18 @@ Return valid JSON with this exact schema:
 }
 """.strip()
 
-CUSTOM_PROMPT_SYSTEM_PROMPT = """
-You are a document analysis assistant running entirely locally.
-
-You will receive:
-- A specific check to perform (the user's prompt)
-- The target document text
-- Retrieved context passages from governing documents
-
-Your job: evaluate the target document against the specific check provided.
-Be explicit about uncertainty. Quote evidence from both the target and the context.
-Do not invent requirements not present in the supplied materials.
-
-Return valid JSON with this exact schema:
-{
-  "issue": "short label summarizing what was checked",
-  "status": "compliant|non_compliant|unclear",
-  "risk_level": "low|medium|high|unclear",
-  "explanation": "2-4 sentence plain-English explanation of your finding",
-  "recommendation": "specific next step if action is needed, or empty string",
-  "target_evidence": ["relevant quote or excerpt from the target document"],
-  "context_evidence": [
-    {
-      "source_file": "filename",
-      "chunk_id": "chunk identifier",
-      "quote": "supporting quote from context passage"
-    }
-  ]
-}
-""".strip()
+CUSTOM_PROMPT_SYSTEM_PROMPT = (
+    "You are a compliance analyst. You will receive a specific check to perform, "
+    "a target document, and relevant context passages.\n\n"
+    "Reply with EXACTLY this format (no other text):\n"
+    "STATUS: compliant | non_compliant | unclear\n"
+    "RISK: low | medium | high | unclear\n"
+    "ISSUE: one sentence label for what was checked\n"
+    "EXPLANATION: 2-4 sentences describing your finding\n"
+    "RECOMMENDATION: specific next step, or 'None required'\n"
+    "TARGET_EVIDENCE: short quote from the target document, or 'None found'\n"
+    "CONTEXT_EVIDENCE: short quote from the context passages, or 'None found'"
+)
 
 PROMPT_BASED_ANALYSIS_SYSTEM_PROMPT = """
 You are a careful legal/compliance analysis assistant running entirely locally.
@@ -467,21 +450,40 @@ def retrieve_relevant_chunks(
 
 def _safe_json_loads(raw: str) -> Dict[str, Any]:
     """
-    Parse possibly fenced or slightly malformed JSON.
+    Parse possibly fenced or prose-wrapped or slightly malformed JSON.
+    Tries three strategies in order:
+    1. Strip markdown fences and parse directly.
+    2. Extract the first {...} block from the text (handles prose preambles).
+    3. Give up and return {}.
     """
     if not raw:
         return {}
 
-    cleaned = re.sub(r"```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
-    cleaned = re.sub(r"\s*```", "", cleaned)
-    cleaned = cleaned.strip()
-    cleaned = re.sub(r",\s*([}\]])", r"\1", cleaned)
+    def _try_parse(text: str) -> Optional[Dict[str, Any]]:
+        text = re.sub(r",\s*([}\]])", r"\1", text).strip()
+        try:
+            result = json.loads(text)
+            return result if isinstance(result, dict) else None
+        except json.JSONDecodeError:
+            return None
 
-    try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError:
-        logging.warning("Failed to parse model JSON output.")
-        return {}
+    # Strategy 1: strip fences
+    cleaned = re.sub(r"```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
+    cleaned = re.sub(r"\s*```", "", cleaned).strip()
+    result = _try_parse(cleaned)
+    if result:
+        return result
+
+    # Strategy 2: find the outermost {...} block in the raw text
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        result = _try_parse(raw[start:end + 1])
+        if result:
+            return result
+
+    logging.warning("Failed to parse model JSON output. Raw response (first 500 chars): %s", raw[:500])
+    return {}
 
 
 def truncate_text(text: str, max_chars: int) -> str:
@@ -730,58 +732,61 @@ def _run_single_custom_prompt(
     target_text: str,
     retrieved_chunks: List[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    """Run one user-supplied prompt against the target document and context."""
-    target_excerpt = truncate_text(target_text, 8000)
-    context_block = format_retrieved_chunks_for_prompt(retrieved_chunks[:8])
+    """
+    Run one user-supplied prompt against the target document and context.
 
-    raw = _retryable_ollama_call(
-        messages=[
-            {"role": "system", "content": CUSTOM_PROMPT_SYSTEM_PROMPT},
-            {"role": "user", "content": (
-                f"CHECK TO PERFORM:\n{custom_prompt}\n\n"
-                f"TARGET DOCUMENT:\n{target_excerpt}\n\n"
-                f"RETRIEVED CONTEXT PASSAGES:\n{context_block}"
-            )},
-        ],
-        temperature=0.1,
-        response_format={"type": "json_object"},
-    )
+    Uses the same focused per-chunk approach as the agentic evaluate step:
+    evaluate the top retrieved chunk against the user's specific check,
+    then pick the most severe finding across all evaluated chunks.
+    """
+    target_summary = truncate_text(target_text, 500)
+    target_excerpt = truncate_text(target_text, 3000)
 
-    parsed = _safe_json_loads(raw)
-    if not parsed:
+    # Evaluate the top chunks against this specific prompt, same as agentic mode
+    chunks_to_check = retrieved_chunks[:3]
+    chunk_findings = []
+    for chunk in chunks_to_check:
+        f = _agent_evaluate_chunk(
+            user_query=custom_prompt,
+            target_summary=target_summary,
+            target_excerpt=target_excerpt,
+            chunk=chunk,
+        )
+        chunk_findings.append(f)
+
+    if not chunk_findings:
         return {
             "issue": custom_prompt[:100],
             "status": "unclear",
             "risk_level": "unclear",
-            "explanation": "Could not parse a structured response for this prompt.",
+            "explanation": "No context chunks were available for this prompt.",
             "recommendation": "",
             "target_evidence": [],
             "context_evidence": [],
         }
 
-    status = str(parsed.get("status", "unclear")).strip().lower()
-    if status not in {"compliant", "non_compliant", "unclear"}:
-        status = "non_compliant" if "non" in status else "unclear"
+    # Pick the most severe finding: non_compliant > unclear > compliant
+    severity = {"non_compliant": 2, "unclear": 1, "compliant": 0}
+    best = max(chunk_findings, key=lambda f: severity.get(f["status"], 1))
 
-    context_evidence = parsed.get("context_evidence", [])
-    if not isinstance(context_evidence, list):
-        context_evidence = []
+    status = best["status"]
+    risk_level = "high" if status == "non_compliant" else ("medium" if status == "unclear" else "low")
 
     return {
-        "issue": parsed.get("issue") or custom_prompt[:100],
+        "issue": best["issue"] or custom_prompt[:100],
         "status": status,
-        "risk_level": parsed.get("risk_level", "unclear"),
-        "explanation": parsed.get("explanation", ""),
-        "recommendation": parsed.get("recommendation", ""),
-        "target_evidence": parsed.get("target_evidence", []) if isinstance(parsed.get("target_evidence"), list) else [],
+        "risk_level": risk_level,
+        "explanation": best["explanation"],
+        "recommendation": "",
+        "target_evidence": [],
         "context_evidence": [
             {
-                "source_file": item.get("source_file", ""),
-                "chunk_id": item.get("chunk_id", ""),
-                "quote": item.get("quote", ""),
+                "source_file": f["source_file"],
+                "chunk_id": f["chunk_id"],
+                "quote": f["evidence"],
             }
-            for item in context_evidence
-            if isinstance(item, dict)
+            for f in chunk_findings
+            if f.get("evidence")
         ],
     }
 
@@ -854,7 +859,6 @@ def _prompt_based_analyze_target(
             )},
         ],
         temperature=0.1,
-        response_format={"type": "json_object"},
     )
 
     parsed = _safe_json_loads(raw)
@@ -1016,8 +1020,10 @@ def check_ollama_health() -> Dict[str, Any]:
             "error": str(exc),
             "models": [],
         }
-    def _safe_int(value: Any, fallback: int) -> int:
-        try:
-            return int(value)
-        except (TypeError, ValueError):
-            return fallback
+
+
+def _safe_int(value: Any, fallback: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return fallback
